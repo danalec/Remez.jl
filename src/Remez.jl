@@ -1,5 +1,7 @@
 module Remez
 
+using LinearAlgebra
+
 export ratfn_minimax, ratfn_minimax_cheb, ratfn_leastsquares, RemezWorkspace
 
 """
@@ -31,6 +33,16 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
     ti_prev1::Vector{T}
     ti_curr::Vector{T}
 
+    # Extrema buffers
+    extrema_x::Vector{T}
+    extrema_y::Vector{T}
+    num_extrema::Base.RefValue{Int}
+    
+    # Winnow buffers
+    winnow_best_score::Matrix{T}
+    winnow_best_idx::Matrix{Int}
+    winnow_back_links::Matrix{Int}
+
     function RemezWorkspace{T}(interval, n, d) where {T}
         lo = T(minimum(interval))
         hi = T(maximum(interval))
@@ -61,8 +73,20 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
         ti_prev1 = Vector{T}(undef, max(n, d) + 1)
         ti_curr = Vector{T}(undef, max(n, d) + 1)
 
+        # Extrema buffers
+        extrema_x = Vector{T}(undef, nnodes + 2) # +2 safety
+        extrema_y = Vector{T}(undef, nnodes + 2)
+        num_extrema = Ref(0)
+        
+        # Winnow buffers
+        n_winnow = n + d + 2
+        winnow_best_score = Matrix{T}(undef, n_winnow, 2)
+        winnow_best_idx = Matrix{Int}(undef, n_winnow, 2)
+        winnow_back_links = Matrix{Int}(undef, nnodes + 2, n_winnow)
+
         new{T}(lo, hi, n, d, nnodes, grid, yvals, matrix, vector, all_coeffs, c_vals, nc_cheb, dc_cheb,
-               sums, poly_matrix, poly_vector, pbasis, ti_prev2, ti_prev1, ti_curr)
+               sums, poly_matrix, poly_vector, pbasis, ti_prev2, ti_prev1, ti_curr,
+               extrema_x, extrema_y, num_extrema, winnow_best_score, winnow_best_idx, winnow_back_links)
     end
 end
 
@@ -246,7 +270,12 @@ function ratfn_leastsquares!(ws::RemezWorkspace{T}, f::Function,
         ws.vector[row] = -get_sum_titj(i, 0, 3)
     end
 
-    ws.all_coeffs .= ws.matrix \ ws.vector
+    # Use LU factorization to solve linear system in-place
+    # ws.matrix is overwritten by lu!
+    # ws.vector is overwritten by ldiv! with the solution
+    F = lu!(ws.matrix)
+    ldiv!(F, ws.vector)
+    ws.all_coeffs .= ws.vector
 
     @inbounds ws.nc_cheb .= ws.all_coeffs[1:n+1]
     ws.dc_cheb[1] = one(T)
@@ -313,7 +342,11 @@ function ratfn_equal_deviation!(ws::RemezWorkspace{T}, f::Function, coords::Abst
             currsign = -currsign
         end
 
-        outvector = ws.poly_matrix \ ws.poly_vector
+        # Solve system in-place
+        F = lu!(ws.poly_matrix)
+        ldiv!(F, ws.poly_vector)
+        outvector = ws.poly_vector
+
         @inbounds ws.nc_cheb .= outvector[1:n+1]
         ws.dc_cheb[1] = one(T)
         return ws.nc_cheb, ws.dc_cheb, outvector[n+2]
@@ -344,7 +377,9 @@ function ratfn_equal_deviation!(ws::RemezWorkspace{T}, f::Function, coords::Abst
                 currsign = -currsign
             end
 
-            ws.all_coeffs .= ws.matrix \ ws.vector
+            F = lu!(ws.matrix)
+            ldiv!(F, ws.vector)
+            ws.all_coeffs .= ws.vector
 
             tx = coords[n+d+2]
             @inbounds ws.nc_cheb .= view(ws.all_coeffs, 1:n+1)
@@ -376,6 +411,151 @@ function ratfn_equal_deviation!(ws::RemezWorkspace{T}, f::Function, coords::Abst
 
         return ws.nc_cheb, ws.dc_cheb
     end
+end
+
+"""
+Find the extrema of a function within a given interval, writing to workspace buffers.
+"""
+function find_extrema!(ws::RemezWorkspace{T}, f) where {T<:AbstractFloat}
+    grid = ws.grid
+    len = length(grid)
+    count = 0
+    
+    y0 = f(grid[1])
+    y1 = f(grid[2])
+    
+    if abs(y0) >= abs(y1)
+        count += 1
+        ws.extrema_x[count] = grid[1]
+        ws.extrema_y[count] = y0
+    end
+
+    yp = y0
+    yi = y1
+    
+    for i in 2:len-1
+        yn = f(grid[i+1])
+        
+        if (yi > yp && yi >= yn) || (yi < yp && yi <= yn)
+            xp, xi, xn = grid[i-1], grid[i], grid[i+1]
+            if yi > yp && yi >= yn
+                # Maximize f
+                x, y = goldensection(f, xp, xi, xn)
+                count += 1
+                ws.extrema_x[count] = x
+                ws.extrema_y[count] = y
+            else
+                # Maximize -f using helper to avoid closure allocation
+                x, y = goldensection_signed(f, xp, xi, xn, -one(T))
+                count += 1
+                ws.extrema_x[count] = x
+                ws.extrema_y[count] = y
+            end
+        end
+        yp = yi
+        yi = yn
+    end
+    
+    if abs(yi) >= abs(yp)
+        count += 1
+        ws.extrema_x[count] = grid[len]
+        ws.extrema_y[count] = yi
+    end
+    
+    ws.num_extrema[] = count
+    return count
+end
+
+function goldensection_signed(f, a::T, b::T, c::T, s::T) where {T<:AbstractFloat}
+    epsbits = precision(T)
+    threshold = abs(c - a) * (T(2)^(-epsbits / 2))
+    one_over_phi = T(2) / (one(T) + sqrt(T(5)))
+
+    if abs(b-a) < abs(c-a)
+        a,  c  = c,  a
+    end
+
+    fa, fb, fc = s*f(a), s*f(b), s*f(c)
+
+    while abs(c-a) > threshold
+        d = a + (b-a) * one_over_phi
+        fd = s*f(d)
+        if fd > fb
+            a,  b,  c  = a,  d,  b
+            fa, fb, fc = fa, fd, fb
+        else
+            a,  b,  c  = c,  b,  d
+            fa, fb, fc = fc, fb, fd
+        end
+    end
+    return (b, s*fb) # return true f(b) value? No, return (b, f(b)). s*fb is the maximized value.
+    # if s is -1, maximized value is -f(b). We want f(b), so we return -maximized.
+    # So return (b, s*fb * s) = (b, fb).
+end
+
+"""
+Winnow extrema using workspace buffers.
+"""
+function winnow_extrema!(ws::RemezWorkspace{T}, count::Int, n::Int) where {T<:AbstractFloat}
+    # Uses ws.extrema_x[1:count], ws.extrema_y[1:count]
+    # Writes result to ws.extrema_x[1:n], ws.extrema_y[1:n]
+    
+    best_score = ws.winnow_best_score
+    best_idx_at_i = ws.winnow_best_idx
+    back_links = ws.winnow_back_links
+    
+    fill!(best_score, -T(Inf))
+    fill!(best_idx_at_i, 0)
+    # back_links doesn't need init if we write carefully?
+    # Better to zero it for safety if needed, but it's large.
+    # We only read what we write.
+    
+    # ... DP implementation ...
+    # We need to be careful with indices.
+    # ws.extrema_y is 1-based.
+    
+    for idx in 1:count
+        y = ws.extrema_y[idx]
+        s = (y > 0) ? 1 : ((y < 0) ? 2 : 0)
+        s == 0 && continue
+        abs_y = abs(y)
+
+        # Base case: i = 1
+        if abs_y > best_score[1, s]
+            best_score[1, s] = abs_y
+            best_idx_at_i[1, s] = idx
+        end
+
+        # Recursive step: i > 1
+        others = 3 - s
+        for i in 2:n
+            if best_score[i-1, others] > -T(Inf)
+                score = min(abs_y, best_score[i-1, others])
+                if score > best_score[i, s]
+                    best_score[i, s] = score
+                    best_idx_at_i[i, s] = idx
+                    back_links[idx, i] = best_idx_at_i[i-1, others]
+                end
+            end
+        end
+    end
+
+    final_sign = (best_score[n, 1] > best_score[n, 2]) ? 1 : 2
+    if best_score[n, final_sign] == -T(Inf)
+        error("winnow_extrema: could not find enough alternating extrema (expected $n).")
+    end
+
+    curr_idx = best_idx_at_i[n, final_sign]
+    for i in n:-1:1
+        ws.extrema_x[i] = ws.extrema_x[curr_idx]
+        ws.extrema_y[i] = ws.extrema_y[curr_idx]
+        if i > 1
+            curr_idx = back_links[curr_idx, i]
+        end
+    end
+    
+    ws.num_extrema[] = n
+    return n
 end
 
 """
@@ -510,26 +690,48 @@ function ratfn_minimax!(ws::RemezWorkspace{T}, f, w = (x, y) -> one(T)) where {T
     threshold = T(2)^(-epsbits / 3)
     max_iters = 100
     local max_err
-    local extrema
-    for iter in 1:max_iters
-        extrema = find_extrema(x -> (ratfn_cheb_eval(ws.nc_cheb, ws.dc_cheb, x, ws.lo, ws.hi) - f(x)) * w(x, f(x)), ws.grid)
-        extrema = winnow_extrema(extrema, ws.n+ws.d+2)
+    
+    # Error function
+    err_func = x -> (ratfn_cheb_eval(ws.nc_cheb, ws.dc_cheb, x, ws.lo, ws.hi) - f(x)) * w(x, f(x))
 
-        min_err = minimum(abs(y) for (x,y) in extrema)
-        max_err = maximum(abs(y) for (x,y) in extrema)
+    for iter in 1:max_iters
+        # Update extrema
+        count = find_extrema!(ws, err_func)
+        
+        # Winnow
+        n_needed = ws.n + ws.d + 2
+        count = winnow_extrema!(ws, count, n_needed)
+
+        # Calculate error stats from winnowed extrema
+        min_err = abs(ws.extrema_y[1])
+        max_err = abs(ws.extrema_y[1])
+        for i in 2:count
+             val = abs(ws.extrema_y[i])
+             if val < min_err min_err = val end
+             if val > max_err max_err = val end
+        end
+
         variation = (max_err - min_err) / max_err
         if variation < threshold
+            extrema = [(ws.extrema_x[i], ws.extrema_y[i]) for i in 1:count]
             return (copy(ws.nc_cheb), copy(ws.dc_cheb), max_err, extrema)
         end
 
-        ratfn_equal_deviation!(ws, f, first.(extrema), max_err, w)
+        ratfn_equal_deviation!(ws, f, view(ws.extrema_x, 1:count), max_err, w)
     end
     
-    # Final coefficients error calculation
-    extrema = find_extrema(x -> (ratfn_cheb_eval(ws.nc_cheb, ws.dc_cheb, x, ws.lo, ws.hi) - f(x)) * w(x, f(x)), ws.grid)
-    extrema = winnow_extrema(extrema, ws.n+ws.d+2)
-    max_err = maximum(abs(y) for (x,y) in extrema)
+    # Final step
+    count = find_extrema!(ws, err_func)
+    n_needed = ws.n + ws.d + 2
+    count = winnow_extrema!(ws, count, n_needed)
     
+    max_err = zero(T)
+    for i in 1:count
+        val = abs(ws.extrema_y[i])
+        if val > max_err max_err = val end
+    end
+    
+    extrema = [(ws.extrema_x[i], ws.extrema_y[i]) for i in 1:count]
     return (copy(ws.nc_cheb), copy(ws.dc_cheb), max_err, extrema)
 end
 

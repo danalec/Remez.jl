@@ -62,11 +62,11 @@ function benchmark_find_extrema()
     
     function compute_error(x)
         real_y = exp(x)
-        approx_y = ratfn_eval(nc, dc, x)
+        approx_y = Remez.ratfn_eval(nc, dc, x)
         return (approx_y - real_y)
     end
     
-    @btime find_extrema($compute_error, $grid)
+    @btime Remez.find_extrema($compute_error, $grid)
 end
 
 function benchmark_winnow_extrema()
@@ -76,7 +76,7 @@ function benchmark_winnow_extrema()
     extrema = [(big(x), sin(20*x)*sin(197*x)) for x in big(0.0):big(0.001):big(1.0)]
     n = 12  # number of extrema to select
     
-    @btime winnow_extrema($extrema, $n)
+    @btime Remez.winnow_extrema($extrema, $n)
 end
 
 function benchmark_poly_eval()
@@ -85,9 +85,9 @@ function benchmark_poly_eval()
     coeffs = [BigFloat(i) for i in 1:100]
     x = big(2.5)
     
-    @btime poly_eval($coeffs, $x)
+    @btime Remez.poly_eval($coeffs, $x)
     
-    result = poly_eval(coeffs, x)
+    result = Remez.poly_eval(coeffs, x)
     println("Result: $result")
 end
 

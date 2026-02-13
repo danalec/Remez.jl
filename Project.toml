@@ -5,6 +5,7 @@ authors = ["Simon Byrne <simonbyrne@gmail.com>", "Dan Alec <danalec@gmail.com>"]
 
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 ProfileView = "c46f51b8-102a-5cf2-8d2c-8597cb0e0da7"
 
 [compat]
