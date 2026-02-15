@@ -4,6 +4,8 @@ using LinearAlgebra
 
 export ratfn_minimax, ratfn_minimax_cheb, ratfn_leastsquares, RemezWorkspace
 
+
+
 """
     RemezWorkspace{T}(interval, n, d)
 
@@ -57,8 +59,9 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
             grid[i+1] = mid - halfwid * cospi(T(i) / T(nnodes))
         end
 
-        matrix = Matrix{T}(undef, n + d + 1, n + d + 1)
-        vector = Vector{T}(undef, n + d + 1)
+        # Matrix size increased to n + d + 2 for Newton-Raphson (which solves for E as well)
+        matrix = Matrix{T}(undef, n + d + 2, n + d + 2)
+        vector = Vector{T}(undef, n + d + 2)
         all_coeffs = Vector{T}(undef, n + d + 1)
         c_vals = Vector{T}(undef, max(n, d) + 1)
         nc_cheb = Vector{T}(undef, n + 1)
@@ -89,6 +92,8 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
                extrema_x, extrema_y, num_extrema, winnow_best_score, winnow_best_idx, winnow_back_links)
     end
 end
+
+
 
 """
 Evaluate a polynomial.
@@ -270,12 +275,11 @@ function ratfn_leastsquares!(ws::RemezWorkspace{T}, f::Function,
         ws.vector[row] = -get_sum_titj(i, 0, 3)
     end
 
-    # Use LU factorization to solve linear system in-place
-    # ws.matrix is overwritten by lu!
-    # ws.vector is overwritten by ldiv! with the solution
-    F = lu!(ws.matrix)
-    ldiv!(F, ws.vector)
-    ws.all_coeffs .= ws.vector
+    mat_view = view(ws.matrix, 1:n+d+1, 1:n+d+1)
+    vec_view = view(ws.vector, 1:n+d+1)
+    F = lu!(mat_view)
+    ldiv!(F, vec_view)
+    ws.all_coeffs .= vec_view
 
     @inbounds ws.nc_cheb .= ws.all_coeffs[1:n+1]
     ws.dc_cheb[1] = one(T)
@@ -342,7 +346,6 @@ function ratfn_equal_deviation!(ws::RemezWorkspace{T}, f::Function, coords::Abst
             currsign = -currsign
         end
 
-        # Solve system in-place
         F = lu!(ws.poly_matrix)
         ldiv!(F, ws.poly_vector)
         outvector = ws.poly_vector
@@ -351,67 +354,209 @@ function ratfn_equal_deviation!(ws::RemezWorkspace{T}, f::Function, coords::Abst
         ws.dc_cheb[1] = one(T)
         return ws.nc_cheb, ws.dc_cheb, outvector[n+2]
     else
-        function try_e(e)
-            currsign = one(T)
-            @inbounds for i in 1:n+d+1
-                x = coords[i]
-                y = f(x)
-                y_adj = y - currsign * e / w(x, y)
-                x_mapped = (2 * x - (hi + lo)) / (hi - lo)
-                
-                ws.c_vals[1] = one(T)
-                if max(n, d) >= 1
-                    ws.c_vals[2] = x_mapped
-                end
-                for deg in 2:max(n, d)
-                    ws.c_vals[deg + 1] = 2 * x_mapped * ws.c_vals[deg] - ws.c_vals[deg - 1]
-                end
-                
-                for j in 0:n
-                    ws.matrix[i, 1 + j] = ws.c_vals[1 + j]
-                end
-                for j in 1:d
-                    ws.matrix[i, 1 + n + j] = -ws.c_vals[1 + j] * y_adj
-                end
-                ws.vector[i] = y_adj
-                currsign = -currsign
-            end
-
-            F = lu!(ws.matrix)
-            ldiv!(F, ws.vector)
-            ws.all_coeffs .= ws.vector
-
-            tx = coords[n+d+2]
-            @inbounds ws.nc_cheb .= view(ws.all_coeffs, 1:n+1)
-            ws.dc_cheb[1] = one(T)
-            @inbounds ws.dc_cheb[2:d+1] .= view(ws.all_coeffs, n+2:n+d+1)
-            
-            y = f(tx)
-            last_err = (ratfn_cheb_eval(ws.nc_cheb, ws.dc_cheb, tx, lo, hi) - y) * w(tx, y) * -currsign
-            return last_err
+        try
+            return ratfn_step_newton!(ws, f, coords, prev_err, w)
+        catch e
+            return ratfn_step_dca!(ws, f, coords, prev_err, w)
         end
-
-        epsbits = precision(T)
-        threshold = T(2)^(-epsbits / 2)
-        e0 = prev_err
-        e1 = try_e(e0)
-        
-        if abs(e1 - e0) > threshold
-            s = sign(e1 - e0)
-            while abs(e1 - e0) > threshold
-                emid = (e1 + e0) / 2
-                enew = try_e(emid)
-                if sign(enew - emid) == s
-                    e0 = emid
-                else
-                    e1 = emid
-                end
-            end
-        end
-
-        return ws.nc_cheb, ws.dc_cheb
     end
 end
+
+"""
+    ratfn_step_newton!(ws, f, coords, prev_err, w)
+
+Perform one step of Newton-Raphson iteration to solve the non-linear system
+for P, Q, and E simultaneously. Quadratic convergence.
+"""
+function ratfn_step_newton!(ws::RemezWorkspace{T}, f::Function, coords::AbstractVector{T},
+                            prev_err::T, w) where {T<:AbstractFloat}
+    n, d = ws.n, ws.d
+    lo, hi = ws.lo, ws.hi
+    
+    # Current state
+    nc = ws.nc_cheb
+    dc = ws.dc_cheb
+    E = prev_err
+
+    # Fill Jacobian and Residual
+    currsign = one(T)
+    
+    @inbounds for i in 1:n+d+2
+        x = coords[i]
+        x_mapped = (2 * x - (hi + lo)) / (hi - lo)
+        y = f(x)
+        weight = w(x, y)
+        
+        # Calculate T_k(x)
+        ws.c_vals[1] = one(T)
+        if max(n, d) >= 1
+            ws.c_vals[2] = x_mapped
+        end
+        for deg in 2:max(n, d)
+            ws.c_vals[deg + 1] = 2 * x_mapped * ws.c_vals[deg] - ws.c_vals[deg - 1]
+        end
+        
+        # Eval P(x) and Q(x)
+        P_val = zero(T)
+        for j in 0:n
+            P_val += nc[j+1] * ws.c_vals[j+1]
+        end
+        
+        Q_val = zero(T)
+        for j in 0:d
+            Q_val += dc[j+1] * ws.c_vals[j+1] # dc[1] is Q_0
+        end
+        
+        # Equation: P(x) - f(x)Q(x) - sigma * E * Q(x) * W(x) = 0
+        # Residual F = P - (f + sigma * E * W) * Q
+        term = y + currsign * E / weight # Wait, def is f(x) - R(x) = +/- E/W ?
+        # Standard: P/Q - f = +/- E/W => P - fQ = +/- E Q / W ?? 
+        # No, standard is error = (R - f)*W.  (P/Q - f)*W = +/- E.
+        # P - fQ = +/- E Q / W. 
+        # Let's match Rust implementation.
+        # Rust: r = (P - fQ - sigma*E*Q/W)
+        # Jacobian:
+        # d/dP_j = T_j
+        # d/dQ_k = -(f + sigma*E/W) * T_k
+        # d/dE   = -sigma * Q / W 
+        
+        inv_w = one(T) / weight
+        sigma_E_inv_w = currsign * E * inv_w
+        
+        # F_i value (Residual)
+        # We want J * delta = -F
+        # So we put F in vector.
+        residual = P_val - (y + sigma_E_inv_w) * Q_val
+        ws.vector[i] = residual
+        
+        # Jacobian Row i
+        # d/dP_j
+        for j in 0:n
+            ws.matrix[i, 1+j] = ws.c_vals[j+1]
+        end
+        
+        # d/dQ_k (k=1..d, since q0=1 is fixed)
+        term_Q = -(y + sigma_E_inv_w)
+        for k in 1:d
+            ws.matrix[i, 1+n+k] = term_Q * ws.c_vals[k+1]
+        end
+        
+        # d/dE
+        ws.matrix[i, 1+n+d+1] = -currsign * Q_val * inv_w
+        
+        currsign = -currsign
+    end
+    
+    ws.vector .*= -1
+    
+    F = lu!(ws.matrix)
+    ldiv!(F, ws.vector)
+    
+    # Update state
+    # vector contains deltas: [dp0..dpn, dq1..dqd, dE]
+    
+    inv_damping = one(T) # Full Newton step
+    
+    @inbounds for j in 0:n
+        ws.nc_cheb[j+1] += ws.vector[1+j] * inv_damping
+    end
+    
+    @inbounds for k in 1:d
+        ws.dc_cheb[k+1] += ws.vector[1+n+k] * inv_damping
+    end
+    
+    new_E = E + ws.vector[1+n+d+1] * inv_damping
+    
+    return ws.nc_cheb, ws.dc_cheb, abs(new_E)
+end
+
+"""
+
+    ratfn_step_dca!(ws, f, coords, prev_err, w)
+
+Legacy bisection-based solver (DCA-like). Robust but slow (linear convergence).
+"""
+function ratfn_step_dca!(ws::RemezWorkspace{T}, f::Function, coords::AbstractVector{T},
+                         prev_err::T, w) where {T<:AbstractFloat}
+    n, d = ws.n, ws.d
+    lo, hi = ws.lo, ws.hi
+    
+    # Use views for the smaller system (N+D+1)
+    # ws.matrix has size N+D+2 x N+D+2
+    mat_view = view(ws.matrix, 1:n+d+1, 1:n+d+1)
+    vec_view = view(ws.vector, 1:n+d+1)
+    
+    function try_e(e)
+        currsign = one(T)
+        @inbounds for i in 1:n+d+1
+            x = coords[i]
+            y = f(x)
+            y_adj = y - currsign * e / w(x, y)
+            x_mapped = (2 * x - (hi + lo)) / (hi - lo)
+            
+            ws.c_vals[1] = one(T)
+            if max(n, d) >= 1
+                ws.c_vals[2] = x_mapped
+            end
+            for deg in 2:max(n, d)
+                ws.c_vals[deg + 1] = 2 * x_mapped * ws.c_vals[deg] - ws.c_vals[deg - 1]
+            end
+            
+            for j in 0:n
+                mat_view[i, 1 + j] = ws.c_vals[1 + j]
+            end
+            for j in 1:d
+                mat_view[i, 1 + n + j] = -ws.c_vals[1 + j] * y_adj
+            end
+            vec_view[i] = y_adj
+            currsign = -currsign
+        end
+
+        # Solve system with view
+        linear_solve!(mat_view, vec_view)
+        
+        # Determine how many coeffs we actually used
+        # vector view now contains solution
+        # Copy to all_coeffs (careful with indices)
+        ws.all_coeffs[1:n+d+1] .= vec_view
+
+        tx = coords[n+d+2]
+        @inbounds ws.nc_cheb .= view(ws.all_coeffs, 1:n+1)
+        ws.dc_cheb[1] = one(T)
+        @inbounds ws.dc_cheb[2:d+1] .= view(ws.all_coeffs, n+2:n+d+1)
+        
+        y = f(tx)
+        last_err = (ratfn_cheb_eval(ws.nc_cheb, ws.dc_cheb, tx, lo, hi) - y) * w(tx, y) * -currsign
+        return last_err
+    end
+
+    epsbits = precision(T)
+    threshold = T(2)^(-epsbits / 2)
+    e0 = prev_err
+    e1 = try_e(e0)
+    
+    if abs(e1 - e0) > threshold
+        s = sign(e1 - e0)
+        while abs(e1 - e0) > threshold
+            emid = (e1 + e0) / 2
+            enew = try_e(emid)
+            if sign(enew - emid) == s
+                e0 = emid
+            else
+                e1 = emid
+            end
+        end
+    end
+
+    return ws.nc_cheb, ws.dc_cheb
+end
+
+# Helper to avoid allocations in lu! on views if possible, or just standard use
+function linear_solve!(A, b)
+    ldiv!(lu!(A), b)
+end
+
+
 
 """
 Find the extrema of a function within a given interval, writing to workspace buffers.
@@ -592,7 +737,7 @@ Find the extrema of a function within a given interval.
 function find_extrema(f::Function, grid::AbstractVector{T}) where {T<:AbstractFloat}
     len = length(grid)
     extrema = Tuple{T, T}[]
-    sizehint!(extrema, 2 * len ÷ 256 + 2)
+    sizehint!(extrema, div(2 * len, 256) + 2)
     
     y0 = f(grid[1])
     y1 = f(grid[2])
@@ -687,7 +832,7 @@ Internal version of `ratfn_minimax` using workspace.
 function ratfn_minimax!(ws::RemezWorkspace{T}, f, w = (x, y) -> one(T)) where {T<:AbstractFloat}
     ratfn_leastsquares!(ws, f, w)
     epsbits = precision(T)
-    threshold = T(2)^(-epsbits / 3)
+    threshold = T(2)^(-epsbits / 1.5)
     max_iters = 100
     local max_err
     
