@@ -38,4 +38,34 @@ using Test
         coeffs_big = [big(1.0), big(2.0), big(3.0)]
         @test typeof(Remez.poly_eval(coeffs_big, big(0.5))) == BigFloat
     end
+
+    # Not being able to find enough alternating extrema is an expected outcome
+    # (the Remez iteration has to be able to start, or repair itself), so both
+    # winnow routines report it instead of throwing.
+    @testset "Winnow reports insufficient extrema" begin
+        same_sign = [(big(0.0), big(1.0)), (big(0.5), big(2.0)), (big(1.0), big(3.0))]
+        @test isempty(Remez.winnow_extrema(same_sign, 2))
+
+        ws = RemezWorkspace{BigFloat}((0.0, 1.0), 0, 0)
+        for i in 1:3
+            ws.extrema_x[i] = BigFloat(i - 1) / 2
+            ws.extrema_y[i] = BigFloat(i)
+        end
+        @test Remez.winnow_extrema!(ws, 3, 2) == 0
+
+        alternating = [(big(0.0), big(1.0)), (big(0.5), big(-2.0)), (big(1.0), big(3.0))]
+        @test length(Remez.winnow_extrema(alternating, 3)) == 3
+    end
+
+    @testset "wellcond is type generic" begin
+        @test Remez.wellcond([1.0, 2.0, 3.0], 0.0, 1.0) isa Float64
+        # A single coefficient is never added to a running value.
+        @test Remez.wellcond([1.0], 0.0, 1.0) == 0.0
+        setprecision(BigFloat, 256) do
+            c = [big(1.0), big(2.0), big(3.0)]
+            @test Remez.wellcond(c, 0.0, 1.0) isa BigFloat
+            # Same arithmetic, just carried out in the coefficient type.
+            @test Remez.wellcond(c, 0.0, 1.0) ≈ Remez.wellcond(Float64.(c), 0.0, 1.0)
+        end
+    end
 end
