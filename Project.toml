@@ -1,7 +1,6 @@
 name = "Remez"
-# This UUID is upstream Remez.jl's (simonbyrne/Remez.jl, registered in General
-# as versions 0.1.0/0.1.1) and is kept on purpose so this fork stays a drop-in
-# replacement. Install it from the repository URL, not with Pkg.add("Remez").
+# Remez is registered in the General registry under this UUID, so it installs
+# and resolves by name.
 uuid = "2e7db186-766a-50e7-8928-5c30181fb135"
 version = "0.2.0"
 authors = ["Simon Byrne <simonbyrne@gmail.com>", "Dan Alec <danalec@gmail.com>"]
