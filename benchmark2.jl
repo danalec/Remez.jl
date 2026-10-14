@@ -3,8 +3,11 @@ using BenchmarkTools
 using Profile
 using ProfileView
 
-include("src/Remez.jl")
-using .Remez
+# Do not `include("src/Remez.jl")` here as well: that defines a second module
+# also named Remez in Main, which makes every exported name ambiguous at the
+# call site and fails the benchmark with an UndefVarError. The benchmark
+# environment already provides this package, precompiled, via
+# benchmark/Project.toml's [sources] entry.
 
 function benchmark_ratfn_leastsquares()
     println("=== Benchmark ratfn_leastsquares ===")
@@ -65,11 +68,12 @@ function benchmark_find_extrema()
     
     function compute_error(x)
         real_y = exp(x)
-        approx_y = ratfn_eval(nc, dc, x)
+        approx_y = Remez.ratfn_eval(nc, dc, x)
         return (approx_y - real_y)
     end
     
-    @btime find_extrema($compute_error, $grid)
+    # find_extrema is internal, not exported, so it has to be qualified.
+    @btime Remez.find_extrema($compute_error, $grid)
 end
 
 function benchmark_winnow_extrema()
@@ -79,7 +83,8 @@ function benchmark_winnow_extrema()
     extrema = [(big(x), sin(20*x)*sin(197*x)) for x in big(0.0):big(0.001):big(1.0)]
     n = 12  # number of extrema to select
     
-    @btime winnow_extrema($extrema, $n)
+    # winnow_extrema is internal, not exported, so it has to be qualified.
+    @btime Remez.winnow_extrema($extrema, $n)
 end
 
 function run_all_benchmarks()
