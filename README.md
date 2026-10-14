@@ -13,7 +13,8 @@ This package provides a high-performance, numerically stable implementation of t
 - **Robustness**: 
     - Safe iteration limits to prevent infinite loops.
     - Robust extrema finding with high-density grid evaluation and golden-section search.
-    - Graceful fallback: Returns the best found approximation if perfect equalization isn't reached.
+    - Graceful fallback: returns the best approximation found if equalization isn't reached, and warns that it did so.
+    - Actionable errors: when a fit cannot be started at all, an `ArgumentError` naming the degrees and the precision available, rather than an internal invariant violation.
 - **Public API**:
     - `ratfn_minimax`: standard minimax (returns power basis).
     - `ratfn_minimax_cheb`: direct Chebyshev basis results.
@@ -21,10 +22,21 @@ This package provides a high-performance, numerically stable implementation of t
 
 ## Installation
 
+This repository is a fork of Simon Byrne's
+[Remez.jl](https://github.com/simonbyrne/Remez.jl) and deliberately keeps the
+upstream package UUID, so this version stays a drop-in replacement for anyone
+already using it. The consequence is that `Pkg.add("Remez")` installs the
+upstream release from the registry, which does **not** provide the
+`RemezWorkspace` / `ratfn_minimax_cheb` API described here. Install this version
+from its repository instead:
+
 ```julia
 using Pkg
-Pkg.add("Remez")
+Pkg.add(url="https://github.com/danalec/Remez.jl")   # or Pkg.develop(path="...")
 ```
+
+Registering this fork under its own name would require a new UUID, which would
+break existing manifests pinned to the current one.
 
 ## Basic Usage
 
@@ -54,6 +66,54 @@ Simply use `big` values for the interval:
 (nc, dc, e, x) = ratfn_minimax(exp, (big(0.0), big(1.0)), 10, 5)
 ```
 
+The precision of the whole computation follows the interval type. To go beyond
+the default 256 bits, set the precision before calling:
+
+```julia
+setprecision(BigFloat, 512)
+(nc, dc, e, x) = ratfn_minimax(exp, (big(0.0), big(1.0)), 10, 5)
+```
+
+### Return values
+
+All three entry points return the same 4-tuple:
+
+- `nc`, `dc` — numerator and denominator coefficients, `n + 1` and `d + 1` long,
+  in the power basis for `ratfn_minimax` and `ratfn_leastsquares`, in the
+  Chebyshev basis for `ratfn_minimax_cheb`. `dc[1] == 1`.
+- `e` — the maximum weighted error over the interval. It is measured over every
+  error extremum, not just the alternation points, so it is an upper bound on
+  the error of the returned approximation rather than a partial estimate.
+- `x` — a vector of `n + d + 2` `(x, weighted error)` pairs, ordered by `x`,
+  with alternating signs. These are the points the Chebyshev alternation
+  theorem certifies.
+
+### Error weighting
+
+All entry points accept an optional weight function `w(x, y)`, which
+equioscillates `(R(x) - f(x)) * w(x, f(x))` instead of the plain error. For
+relative error on an exponential, pass `w = (x, y) -> 1/y`:
+
+```julia
+(nc, dc, e, x) = ratfn_minimax(exp, (0.0, 1.0), 4, 0, (x, y) -> 1/y)
+```
+
+## Precision and convergence
+
+The iteration stops when the error is equioscillated to a relative tolerance
+derived from the working precision. In `Float64` that tolerance is reachable
+for polynomial fits and for rational fits up to roughly `(3, 3)`; beyond that,
+and in `Float64` generally, the iteration may not converge. In that case the
+package returns the best approximation it found and emits a warning — it does
+not silently return a worse answer, and `e` still bounds the returned
+approximation's error.
+
+Some fits cannot be started at all in `Float64`: the least-squares seed's error
+function may not have the `n + d + 2` alternating extrema the iteration needs
+(the same limitation exists in the original Remez implementation). That is
+reported as an `ArgumentError` naming the degrees and suggesting higher
+precision. Use `BigFloat` for those cases.
+
 ## Advanced Usage
 
 ### Direct Chebyshev Coefficients
@@ -77,8 +137,12 @@ ws = RemezWorkspace{Float64}((0.0, 1.0), 3, 3)
 
 The test suite is modularized into several focused files:
 - `test_utils.jl`: Internal utility functions and math helpers.
-- `test_minimax.jl`: Core minimax and least-squares verification.
+- `test_minimax.jl`: Core minimax and least-squares verification, plus the
+  reported-error bound, the non-converged fallback, and the failure modes.
+- `verify_newton.jl`: Newton-Raphson solver verification (equioscillation).
 - `test_genericity.jl`: Verification of type stability and precision across different numeric types.
+
+`test/runtests.jl` is the only entry point and includes the other four files.
 
 To run all tests:
 ```bash
@@ -87,23 +151,44 @@ julia --project=. test/runtests.jl
 
 ## Benchmarking
 
-The project include benchmark scripts to measure performance and profile bottlenecks:
+Benchmark scripts live at the repo root. Their dependencies are in
+`benchmark/Project.toml` rather than the package's own `Project.toml`, so that
+installing Remez does not drag in Gtk4 (via `ProfileView`) for tooling only this
+repository uses:
 
-- **[benchmark2.jl](benchmark2.jl)**: Standard benchmarking of core Remez functions with `BenchmarkTools`.
-- **[benchmark.jl](benchmark.jl)**: Comprehensive benchmarking and terminal-optimized profiling using `Profile`.
-- **[profile_remez.jl](profile_remez.jl)**: Specific script for profiling the minimax loop.
-
-To run the standard benchmark:
 ```bash
-julia --project=. benchmark.jl
+julia --project=benchmark -e 'using Pkg; Pkg.instantiate()'   # once
+julia --project=benchmark benchmark.jl
+julia --project=benchmark profile_remez.jl
 ```
 
-## Performance Comparison
+- **[benchmark.jl](benchmark.jl)**: benchmarks the core functions with `BenchmarkTools` and profiles with `Profile`/`ProfileView`.
+- **[benchmark2.jl](benchmark2.jl)**: the smaller set of benchmarks (least-squares, `find_extrema`, `winnow_extrema`, minimax).
+- **[profile_remez.jl](profile_remez.jl)**: focused profile of the minimax loop.
 
-Compared to the original implementation, this version offers:
-- **Major Allocation Reductions**: `RemezWorkspace` eliminates almost all per-iteration heap allocations.
-- **Improved Algorithmic Stability**: The new DP-based winnowing logic ensures stable convergence even for delicate rational fits.
-- **Optimized Evaluation**: Faster coefficient conversion and evaluation routines.
+Internal functions such as `find_extrema` and `winnow_extrema` are not
+exported, so the scripts call them qualified (`Remez.find_extrema`).
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the test suite on
+Julia 1.10 (the lower bound from `Project.toml` compat) and 1.13.
+
+## Performance
+
+`RemezWorkspace` pre-allocates every buffer the iteration touches, so the loop
+itself allocates nothing; what remains is the returned coefficient copies and
+the extrema vector. Measured with `@allocated` on a warm workspace
+(`Float64`, `exp` on `[0, 1]`, Julia 1.13):
+
+| fit | workspace call | allocating call |
+|---|---|---|
+| 3/0 | 1 664 B | 78 995 B |
+| 2/2 | 3 184 B | 109 139 B |
+| 4/2 | 5 264 B | — |
+
+The dense grid is `256 * (n + d + 1) + 1` Chebyshev nodes, which is what makes
+the extrema search reliable at the cost of the evaluation budget.
 
 ## License
 
