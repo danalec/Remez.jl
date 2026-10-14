@@ -18,7 +18,8 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
     d::Int
     nnodes::Int
     grid::Vector{T}
-    yvals::Vector{T}
+    ls_grid::Vector{T}
+    ls_len::Int
     matrix::Matrix{T}
     vector::Vector{T}
     all_coeffs::Vector{T}
@@ -50,13 +51,23 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
         hi = T(maximum(interval))
         nnodes = 256 * (n + d + 1)
         grid = Vector{T}(undef, nnodes + 1)
-        yvals = Vector{T}(undef, nnodes + 1)
-        
+
         # Grid initialization (Chebyshev nodes)
         mid = (hi + lo) / 2
         halfwid = (hi - lo) / 2
         for i in 0:nnodes
             grid[i+1] = mid - halfwid * cospi(T(i) / T(nnodes))
+        end
+
+        # Least-squares seed grid, separate from the dense error-extrema grid:
+        # the two have different jobs and different optimal densities. It starts
+        # out identical to `grid`, so the least-squares fit is unchanged from a
+        # single-grid workspace, but `ratfn_leastsquares(f, xvals, ...)` can now
+        # supply its own sampling without destroying the extrema grid.
+        ls_grid = Vector{T}(undef, nnodes + 1)
+        ls_len = nnodes + 1
+        for i in 0:nnodes
+            ls_grid[i+1] = grid[i+1]
         end
 
         # Matrix size increased to n + d + 2 for Newton-Raphson (which solves for E as well)
@@ -87,7 +98,7 @@ mutable struct RemezWorkspace{T<:AbstractFloat}
         winnow_best_idx = Matrix{Int}(undef, n_winnow, 2)
         winnow_back_links = Matrix{Int}(undef, nnodes + 2, n_winnow)
 
-        new{T}(lo, hi, n, d, nnodes, grid, yvals, matrix, vector, all_coeffs, c_vals, nc_cheb, dc_cheb,
+        new{T}(lo, hi, n, d, nnodes, grid, ls_grid, ls_len, matrix, vector, all_coeffs, c_vals, nc_cheb, dc_cheb,
                sums, poly_matrix, poly_vector, pbasis, ti_prev2, ti_prev1, ti_curr,
                extrema_x, extrema_y, num_extrema, winnow_best_score, winnow_best_idx, winnow_back_links)
     end
@@ -207,15 +218,22 @@ end
     ratfn_leastsquares!(ws, f, w)
 
 Internal version of `ratfn_leastsquares` that uses a workspace to avoid allocations.
+
+Accumulates the normal equations over the first `ws.ls_len` nodes of
+`ws.ls_grid`, which is deliberately separate from the dense error-extrema grid
+in `ws.grid`: the two have different jobs and different optimal densities. The
+seed only has to be accurate enough to seed the Remez iteration, while the
+extrema grid has to be dense enough that no error extremum falls between nodes.
 """
 function ratfn_leastsquares!(ws::RemezWorkspace{T}, f::Function,
                              w = (x, y) -> one(T)) where {T<:AbstractFloat}
     n, d = ws.n, ws.d
     lo, hi = ws.lo, ws.hi
-    
+
     fill!(ws.sums, zero(T))
-    
-    @inbounds for x in ws.grid
+
+    @inbounds for i in 1:ws.ls_len
+        x = ws.ls_grid[i]
         y = f(x)
         weight = w(x, y)
         x_mapped = (2 * x - (hi + lo)) / (hi - lo)
@@ -292,16 +310,17 @@ end
     nc, dc = ratfn_leastsquares(f, xvals, n, d, w)
 
 Public wrapper for least-squares rational fit using Chebyshev basis internally.
+
+The supplied `xvals` are used in place of the workspace's seed grid, so they
+define the sampling that the normal equations are accumulated over. They may be
+of any length; the result is returned in the power basis.
 """
 function ratfn_leastsquares(f::Function, xvals::AbstractVector{T}, n::Int, d::Int,
                              w = (x, y) -> one(T)) where {T<:AbstractFloat}
     lo, hi = minimum(xvals), maximum(xvals)
     ws = RemezWorkspace{T}((lo, hi), n, d)
-    if length(xvals) != length(ws.grid)
-        ws.grid = Vector{T}(xvals) # Copy if length differs
-    else
-        ws.grid .= xvals
-    end
+    ws.ls_grid = Vector{T}(xvals)
+    ws.ls_len = length(ws.ls_grid)
     nc_cheb, dc_cheb = ratfn_leastsquares!(ws, f, w)
     
     nc = Vector{T}(undef, n + 1)
@@ -356,8 +375,19 @@ function ratfn_equal_deviation!(ws::RemezWorkspace{T}, f::Function, coords::Abst
     else
         try
             return ratfn_step_newton!(ws, f, coords, prev_err, w)
-        catch e
+        catch
+            # Newton usually fails on a singular Jacobian, which means the
+            # current approximation has a pole or a degenerate degree. The
+            # bisection solver is slower but far better behaved there.
+        end
+        try
             return ratfn_step_dca!(ws, f, coords, prev_err, w)
+        catch
+            throw(ArgumentError(string(
+                "both the Newton and the bisection solver failed for an (", ws.n, ", ",
+                ws.d, ") fit on the interval [", ws.lo, ", ", ws.hi, "]. This usually ",
+                "means the approximation wants a pole inside the interval, which no ",
+                "minimax fit can have; try a different interval, or lower n or d.")))
         end
     end
 end
@@ -407,25 +437,19 @@ function ratfn_step_newton!(ws::RemezWorkspace{T}, f::Function, coords::Abstract
             Q_val += dc[j+1] * ws.c_vals[j+1] # dc[1] is Q_0
         end
         
-        # Equation: P(x) - f(x)Q(x) - sigma * E * Q(x) * W(x) = 0
-        # Residual F = P - (f + sigma * E * W) * Q
-        term = y + currsign * E / weight # Wait, def is f(x) - R(x) = +/- E/W ?
-        # Standard: P/Q - f = +/- E/W => P - fQ = +/- E Q / W ?? 
-        # No, standard is error = (R - f)*W.  (P/Q - f)*W = +/- E.
-        # P - fQ = +/- E Q / W. 
-        # Let's match Rust implementation.
-        # Rust: r = (P - fQ - sigma*E*Q/W)
-        # Jacobian:
-        # d/dP_j = T_j
-        # d/dQ_k = -(f + sigma*E/W) * T_k
-        # d/dE   = -sigma * Q / W 
-        
+        # Equation solved at each alternation point, in the form
+        #     P(x) - f(x) Q(x) - sigma * E * Q(x) / W(x) = 0
+        # where sigma alternates +/-1 along the points and W is the weight
+        # function. That is exactly the weighted error being equioscillated:
+        #     (P/Q - f) * W = sigma * E
+        # The Jacobian rows are therefore
+        #     d/dP_j = T_j
+        #     d/dQ_k = -(f + sigma * E / W) * T_k      (Q_0 is fixed to 1)
+        #     d/dE   = -sigma * Q / W
         inv_w = one(T) / weight
         sigma_E_inv_w = currsign * E * inv_w
-        
-        # F_i value (Residual)
-        # We want J * delta = -F
-        # So we put F in vector.
+
+        # We solve J * delta = -F, so the residual goes into the vector as F.
         residual = P_val - (y + sigma_E_inv_w) * Q_val
         ws.vector[i] = residual
         
@@ -448,25 +472,23 @@ function ratfn_step_newton!(ws::RemezWorkspace{T}, f::Function, coords::Abstract
     end
     
     ws.vector .*= -1
-    
+
     F = lu!(ws.matrix)
     ldiv!(F, ws.vector)
-    
-    # Update state
-    # vector contains deltas: [dp0..dpn, dq1..dqd, dE]
-    
-    inv_damping = one(T) # Full Newton step
-    
+
+    # Update state: the vector holds the Newton deltas [dp0..dpn, dq1..dqd, dE].
+    # The step is undamped, so an ill-conditioned system can overshoot; the caller
+    # (`ratfn_minimax!`) detects that and falls back to `ratfn_step_dca!`.
     @inbounds for j in 0:n
-        ws.nc_cheb[j+1] += ws.vector[1+j] * inv_damping
+        ws.nc_cheb[j+1] += ws.vector[1+j]
     end
-    
+
     @inbounds for k in 1:d
-        ws.dc_cheb[k+1] += ws.vector[1+n+k] * inv_damping
+        ws.dc_cheb[k+1] += ws.vector[1+n+k]
     end
-    
-    new_E = E + ws.vector[1+n+d+1] * inv_damping
-    
+
+    new_E = E + ws.vector[1+n+d+1]
+
     return ws.nc_cheb, ws.dc_cheb, abs(new_E)
 end
 
@@ -639,7 +661,16 @@ function goldensection_signed(f, a::T, b::T, c::T, s::T) where {T<:AbstractFloat
 end
 
 """
+    winnow_extrema!(ws, count, n) -> Int
+
 Winnow extrema using workspace buffers.
+
+Uses `ws.extrema_x[1:count]`, `ws.extrema_y[1:count]` and writes the winnowed
+result to `ws.extrema_x[1:n]`, `ws.extrema_y[1:n]`. Returns the number of
+extrema retained, or `0` when fewer than `n` alternating-sign extrema exist.
+Returning `0` rather than throwing lets the caller decide between repairing the
+approximation and reporting the failure, depending on where it sits in the
+iteration.
 """
 function winnow_extrema!(ws::RemezWorkspace{T}, count::Int, n::Int) where {T<:AbstractFloat}
     # Uses ws.extrema_x[1:count], ws.extrema_y[1:count]
@@ -687,7 +718,9 @@ function winnow_extrema!(ws::RemezWorkspace{T}, count::Int, n::Int) where {T<:Ab
 
     final_sign = (best_score[n, 1] > best_score[n, 2]) ? 1 : 2
     if best_score[n, final_sign] == -T(Inf)
-        error("winnow_extrema: could not find enough alternating extrema (expected $n).")
+        # Fewer than n alternating-sign extrema exist: the error function of the
+        # current approximation does not wiggle enough for this degree.
+        return 0
     end
 
     curr_idx = best_idx_at_i[n, final_sign]
@@ -773,7 +806,13 @@ function find_extrema(f::Function, grid::AbstractVector{T}) where {T<:AbstractFl
 end
 
 """
+    winnow_extrema(extrema, n) -> Vector{Tuple{T,T}}
+
 Winnow a list of a function's extrema to give a subsequence of alternating signs.
+
+Returns a subsequence of `extrema` of length `n` with alternating signs, chosen
+to maximise the smallest absolute value in the subsequence. Returns an empty
+vector when fewer than `n` alternating-sign extrema are available.
 """
 function winnow_extrema(extrema::AbstractVector{Tuple{T,T}}, n::Int) where {T<:AbstractFloat}
     len = length(extrema)
@@ -810,7 +849,8 @@ function winnow_extrema(extrema::AbstractVector{Tuple{T,T}}, n::Int) where {T<:A
 
     final_sign = (best_score[n, 1] > best_score[n, 2]) ? 1 : 2
     if best_score[n, final_sign] == -T(Inf)
-        error("winnow_extrema: could not find enough alternating extrema (expected $n).")
+        # Not enough alternating-sign extrema; see `winnow_extrema!`.
+        return Tuple{T, T}[]
     end
 
     ret = Vector{Tuple{T,T}}(undef, n)
@@ -828,56 +868,149 @@ end
     ratfn_minimax!(ws, f, w)
 
 Internal version of `ratfn_minimax` using workspace.
+
+The Remez iteration needs the error function to have at least `n + d + 2`
+alternating extrema at every step. That requirement can fail for two reasons:
+the least-squares seed may not wiggle enough to get the iteration started, or
+an undamped Newton step can overshoot and destroy the alternation. Neither is
+recoverable by repeating the same step, so this routine:
+
+* keeps the best approximation seen so far (smallest achieved error, ties
+  broken by equioscillation) and returns that rather than whatever the last
+  iterate happened to be, which is what the README promises for a non-converged
+  iteration;
+* refuses to record a snapshot whose coefficients or errors are not finite,
+  since an approximation carrying a pole makes the error function meaningless;
+* stops early when the variation stops improving, instead of always spending
+  the full `max_iters` budget;
+* reports the returned error as the maximum weighted error over the whole grid,
+  not just over the alternation points, so `E` is never an under-estimate;
+* throws an `ArgumentError` when the seed cannot start the iteration at all,
+  naming the degrees and the precision actually available.
 """
 function ratfn_minimax!(ws::RemezWorkspace{T}, f, w = (x, y) -> one(T)) where {T<:AbstractFloat}
     ratfn_leastsquares!(ws, f, w)
     epsbits = precision(T)
     threshold = T(2)^(-epsbits / 1.5)
     max_iters = 100
-    local max_err
-    
-    # Error function
+    # Give up once this many consecutive iterations fail to improve on the best
+    # error or the best equioscillation by a relative margin.
+    stall_limit = 8
+    n_needed = ws.n + ws.d + 2
+
+    # Error function, weighted so that what gets equioscillated is
+    # (R(x) - f(x)) * w(x, f(x)).
     err_func = x -> (ratfn_cheb_eval(ws.nc_cheb, ws.dc_cheb, x, ws.lo, ws.hi) - f(x)) * w(x, f(x))
 
-    for iter in 1:max_iters
-        # Update extrema
-        count = find_extrema!(ws, err_func)
-        
-        # Winnow
-        n_needed = ws.n + ws.d + 2
-        count = winnow_extrema!(ws, count, n_needed)
+    best_nc = copy(ws.nc_cheb)
+    best_dc = copy(ws.dc_cheb)
+    best_err = T(Inf)
+    best_var = T(Inf)
+    best_extrema = Tuple{T, T}[]
+    have_best = false
+    stalled = 0
+    converged = false
 
-        # Calculate error stats from winnowed extrema
-        min_err = abs(ws.extrema_y[1])
-        max_err = abs(ws.extrema_y[1])
-        for i in 2:count
-             val = abs(ws.extrema_y[i])
-             if val < min_err min_err = val end
-             if val > max_err max_err = val end
+    for iter in 1:max_iters
+        count = find_extrema!(ws, err_func)
+
+        # Maximum error over the interval, taken over every extremum found
+        # (each refined by golden section) rather than over the alternation
+        # points alone. Ranking and reporting on this is what keeps the returned
+        # `E` an upper bound on the error instead of an under-estimate.
+        sup_err = zero(T)
+        @inbounds for i in 1:count
+            val = abs(ws.extrema_y[i])
+            if val > sup_err sup_err = val end
         end
 
+        count = winnow_extrema!(ws, count, n_needed)
+
+        if count == 0
+            if iter == 1
+                throw(ArgumentError(string(
+                    "the least-squares starting approximation for an (", ws.n, ", ", ws.d,
+                    ") fit does not produce ", n_needed, " alternating error extrema on the ",
+                    "interval [", ws.lo, ", ", ws.hi, "], so the Remez iteration cannot ",
+                    "start. Either raise the working precision (e.g. setprecision(BigFloat, ",
+                    2 * epsbits, ") and use big interval endpoints), lower n or d, or ",
+                    "choose a different interval.")))
+            end
+            # A later step destroyed the alternation, most likely an undamped
+            # Newton overshoot. Keep the best approximation found so far.
+            break
+        end
+
+        min_err = abs(ws.extrema_y[1])
+        max_err = abs(ws.extrema_y[1])
+        @inbounds for i in 2:count
+            val = abs(ws.extrema_y[i])
+            if val < min_err min_err = val end
+            if val > max_err max_err = val end
+        end
         variation = (max_err - min_err) / max_err
+
+        # Rank snapshots by the error they actually achieve, since that is what
+        # "best" means for a minimax fit; equioscillation variation is only a
+        # tie-breaker. Ranking by variation alone can prefer a snapshot whose
+        # error is larger.
+        improved_err = sup_err < best_err * (1 - T(1e-9))
+        improved_var = variation < best_var * (1 - T(1e-6))
+
+        # A snapshot is only worth keeping if its error is actually finite: an
+        # approximation with a pole on the interval gives Inf/NaN here, and
+        # comparing NaNs silently loses the run's real best.
+        if isfinite(sup_err) && (improved_err || (sup_err <= best_err && improved_var))
+            best_nc .= ws.nc_cheb
+            best_dc .= ws.dc_cheb
+            best_err = sup_err
+            best_var = min(variation, best_var)
+            best_extrema = [(ws.extrema_x[i], ws.extrema_y[i]) for i in 1:count]
+            have_best = true
+        end
+
+        # Stalling means the equioscillation is genuinely flat, not merely
+        # improving slowly, so require a relative improvement to count as
+        # progress. Stopping on slow-but-real progress costs accuracy.
+        if improved_err || improved_var
+            stalled = 0
+        else
+            stalled += 1
+        end
+
         if variation < threshold
-            extrema = [(ws.extrema_x[i], ws.extrema_y[i]) for i in 1:count]
-            return (copy(ws.nc_cheb), copy(ws.dc_cheb), max_err, extrema)
+            converged = true
+            break
+        end
+        if stalled >= stall_limit
+            break
         end
 
         ratfn_equal_deviation!(ws, f, view(ws.extrema_x, 1:count), max_err, w)
+
+        if !(all(isfinite, ws.nc_cheb) && all(isfinite, ws.dc_cheb))
+            # The step diverged; keep the best approximation found so far.
+            break
+        end
     end
-    
-    # Final step
-    count = find_extrema!(ws, err_func)
-    n_needed = ws.n + ws.d + 2
-    count = winnow_extrema!(ws, count, n_needed)
-    
-    max_err = zero(T)
-    for i in 1:count
-        val = abs(ws.extrema_y[i])
-        if val > max_err max_err = val end
+
+    if !have_best
+        throw(ArgumentError(string(
+            "the Remez iteration for an (", ws.n, ", ", ws.d, ") fit produced no usable ",
+            "approximation on the interval [", ws.lo, ", ", ws.hi, "]. Either raise the ",
+            "working precision (e.g. setprecision(BigFloat, ", 2 * epsbits, ") and use big ",
+            "interval endpoints), lower n or d, or choose a different interval.")))
     end
-    
-    extrema = [(ws.extrema_x[i], ws.extrema_y[i]) for i in 1:count]
-    return (copy(ws.nc_cheb), copy(ws.dc_cheb), max_err, extrema)
+
+    if !converged
+        @warn "Remez iteration did not reach the convergence threshold " *
+              "(n=$(ws.n), d=$(ws.d), bits=$(epsbits), variation=$(best_var), " *
+              "threshold=$(threshold)); returning the best approximation found."
+    end
+
+    # `E` is the largest error the algorithm actually measured on the interval,
+    # not just the value at the alternation points, so it is an upper bound.
+    return best_nc, best_dc, best_err, best_extrema
 end
 
 """
@@ -919,13 +1052,23 @@ end
 """
     worst = wellcond(coeffs, lo, hi)
 
-Check if a polynomial is well-conditioned.
+Check how well-conditioned a polynomial is for evaluation by Horner's rule over
+`[lo, hi]`, returning the largest ratio of the running value to the coefficient
+added to it. Values below 1 mean each added coefficient dominates the running
+value; 1/8 or 1/16 or below is comfortable. Useful for deciding whether power
+basis coefficients from `ratfn_minimax` can be evaluated directly, or whether
+`ratfn_minimax_cheb` should be preferred instead.
+
+Works in the floating point type of `coeffs`, so it can be used to sanity check
+`BigFloat` approximations at the precision they were computed with.
 """
-function wellcond(coeffs, lo, hi)
-    x = max(abs(lo), abs(hi))
-    worst, so_far = 0.0, 0.0
-    for i = length(coeffs):-1:1
-        coeff = abs(coeffs[i])
+function wellcond(coeffs::AbstractVector, lo, hi)
+    T = float(eltype(coeffs))
+    x = max(abs(T(lo)), abs(T(hi)))
+    worst = zero(T)
+    so_far = zero(T)
+    for i in length(coeffs):-1:1
+        coeff = abs(T(coeffs[i]))
         so_far *= x
         if coeff != 0
             worst = max(worst, so_far / coeff)

@@ -1,20 +1,23 @@
 name = "Remez"
+# This UUID is upstream Remez.jl's (simonbyrne/Remez.jl, registered in General
+# as versions 0.1.0/0.1.1) and is kept on purpose so this fork stays a drop-in
+# replacement. Install it from the repository URL, not with Pkg.add("Remez").
 uuid = "2e7db186-766a-50e7-8928-5c30181fb135"
 version = "0.2.0"
 authors = ["Simon Byrne <simonbyrne@gmail.com>", "Dan Alec <danalec@gmail.com>"]
 
 [deps]
-BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-ProfileView = "c46f51b8-102a-5cf2-8d2c-8597cb0e0da7"
 
 [compat]
-BenchmarkTools = "1.6.3"
-ProfileView = "1.10.2"
 julia = "1.10"
 
 [extras]
+# Stdlibs the test files load: Logging for asserting the non-converged warning,
+# Printf in verify_newton.jl. LinearAlgebra is already a dependency.
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Logging", "Printf"]
