@@ -146,8 +146,14 @@ The test suite is modularized into several focused files:
 
 To run all tests:
 ```bash
-julia --project=. test/runtests.jl
+julia --project=. -e 'using Pkg; Pkg.test()'
 ```
+
+`Pkg.test()` is the command to use: it runs the suite in the environment built
+from the `test` target, which is what CI runs. Running
+`julia --project=. test/runtests.jl` directly also works, but it sees the
+ambient environment, so it will not notice a test file using a standard library
+that is missing from the `test` target in `Project.toml`.
 
 ## Benchmarking
 
